@@ -6,16 +6,27 @@ const multer = require("multer");
 const fs = require("fs");
 const path = require("path");
 const axios = require("axios");
-const FormData = require("form-data");
 const sqlite3 = require("sqlite3").verbose();
+const { v2: cloudinary } = require("cloudinary");
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
+app.use((req, res, next) => {
+  console.log(`[${new Date().toISOString()}] ${req.method} ${req.originalUrl}`);
+  next();
+});
+
 const PORT = process.env.PORT || 3000;
 const UPLOADS_DIR = path.join(__dirname, "uploads");
 const DB_PATH = path.join(__dirname, "database.sqlite");
+
+cloudinary.config({
+  cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
+  api_key: process.env.CLOUDINARY_API_KEY,
+  api_secret: process.env.CLOUDINARY_API_SECRET
+});
 
 if (!fs.existsSync(UPLOADS_DIR)) {
   fs.mkdirSync(UPLOADS_DIR, { recursive: true });
@@ -183,23 +194,17 @@ async function incrementUserDailyCount(userId) {
   );
 }
 
-async function uploadImageToImgBB(filePath) {
-  const imageBase64 = fs.readFileSync(filePath, { encoding: "base64" });
-
-  const form = new FormData();
-  form.append("key", process.env.IMGBB_API_KEY);
-  form.append("image", imageBase64);
-
-  const response = await axios.post("https://api.imgbb.com/1/upload", form, {
-    headers: form.getHeaders(),
-    maxBodyLength: Infinity
+async function uploadImageToCloudinary(filePath) {
+  const result = await cloudinary.uploader.upload(filePath, {
+    resource_type: "image",
+    folder: "archvideo"
   });
 
-  if (!response.data || !response.data.success) {
-    throw new Error("ImgBB upload failed.");
+  if (!result || !result.secure_url) {
+    throw new Error("Cloudinary upload failed.");
   }
 
-  return response.data.data.url;
+  return result.secure_url;
 }
 
 function buildPrompt(motionType, customPrompt) {
@@ -375,6 +380,10 @@ app.post("/api/generate", upload.single("image"), async (req, res) => {
   let uploadedFilePath = null;
 
   try {
+    console.log("POST /api/generate hit");
+    console.log("Body:", req.body);
+    console.log("File:", req.file ? req.file.originalname : "NO_FILE");
+
     const { motionType, user_id, is_premium, quality, customPrompt } = req.body;
 
     if (!req.file) {
@@ -452,7 +461,7 @@ app.post("/api/generate", upload.single("image"), async (req, res) => {
 
     const generationId = insertResult.lastID;
 
-    const publicImageUrl = await uploadImageToImgBB(uploadedFilePath);
+    const publicImageUrl = await uploadImageToCloudinary(uploadedFilePath);
 
     await runQuery(
       `UPDATE generations
@@ -620,6 +629,11 @@ app.get("/api/usage/:userId", async (req, res) => {
 
 initDatabase()
   .then(() => {
+    console.log("REPLICATE_API_TOKEN exists:", !!process.env.REPLICATE_API_TOKEN);
+    console.log("CLOUDINARY_CLOUD_NAME exists:", !!process.env.CLOUDINARY_CLOUD_NAME);
+    console.log("CLOUDINARY_API_KEY exists:", !!process.env.CLOUDINARY_API_KEY);
+    console.log("CLOUDINARY_API_SECRET exists:", !!process.env.CLOUDINARY_API_SECRET);
+
     app.listen(PORT, () => {
       console.log(`Server running on port ${PORT}`);
     });
