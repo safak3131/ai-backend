@@ -504,7 +504,7 @@ app.post("/api/generate", upload.single("image"), async(req, res) => {
             generation: failedRow
         });
     } catch (error) {
-        console.error("Generate error:", error.response ? .data || error.message);
+        console.error("Generate error:", error.response?.data || error.message);
 
         return res.status(500).json({
             success: false,
