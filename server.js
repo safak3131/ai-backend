@@ -10,6 +10,10 @@ const sqlite3 = require("sqlite3").verbose();
 const { v2: cloudinary } = require("cloudinary");
 const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
+const {
+  SignedDataVerifier,
+  Environment: AppleEnvironment
+} = require("@apple/app-store-server-library");
 
 const app = express();
 app.use(cors());
@@ -24,6 +28,30 @@ const PORT = process.env.PORT || 3000;
 const JWT_SECRET = process.env.JWT_SECRET || "change-me";
 const UPLOADS_DIR = path.join(__dirname, "uploads");
 const DB_PATH = path.join(__dirname, "database.sqlite");
+
+// Apple / IAP
+const APPLE_BUNDLE_ID = process.env.APPLE_BUNDLE_ID || "";
+const APPLE_APP_ID = process.env.APPLE_APP_ID
+  ? Number(process.env.APPLE_APP_ID)
+  : undefined;
+
+// Bu dosyaları repoya ekleyebilirsin veya sonra secret file olarak koyarsın.
+// Şimdilik basit tutuyorum.
+const APPLE_ROOT_CA_G3_PATH = path.join(__dirname, "AppleRootCA-G3.cer");
+const APPLE_ROOT_CA_PATH = path.join(__dirname, "AppleIncRootCertificate.cer");
+
+// Kredi paketleri
+const CREDIT_PRODUCTS = {
+  credits_10: 10,
+  credits_30: 35,
+  credits_100: 120
+};
+
+// Video maliyeti
+const QUALITY_COSTS = {
+  low: 1,
+  high: 3
+};
 
 cloudinary.config({
   cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
@@ -111,6 +139,20 @@ async function initDatabase() {
       replicate_prediction_id TEXT,
       created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
       updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
+
+  await runQuery(`
+    CREATE TABLE IF NOT EXISTS purchases (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id INTEGER NOT NULL,
+      product_id TEXT NOT NULL,
+      transaction_id TEXT NOT NULL UNIQUE,
+      original_transaction_id TEXT,
+      credits_added INTEGER NOT NULL DEFAULT 0,
+      environment TEXT,
+      raw_signed_transaction TEXT,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
     )
   `);
 }
@@ -210,13 +252,20 @@ async function authMiddleware(req, res, next) {
   }
 }
 
-async function decrementCredit(userId) {
+function getCreditCostForQuality(quality) {
+  if (!QUALITY_COSTS[quality]) {
+    throw new Error("Geçersiz quality.");
+  }
+  return QUALITY_COSTS[quality];
+}
+
+async function decrementCredit(userId, amount) {
   await runQuery(
     `UPDATE users
-     SET credits = credits - 1,
+     SET credits = credits - ?,
          updated_at = CURRENT_TIMESTAMP
-     WHERE id = ? AND credits > 0`,
-    [userId]
+     WHERE id = ? AND credits >= ?`,
+    [amount, userId, amount]
   );
 }
 
@@ -391,6 +440,68 @@ async function updateGenerationStatus(id, data) {
   );
 }
 
+// Apple root CA dosyalarını yükle
+function loadAppleRootCertificates() {
+  const certs = [];
+
+  if (fs.existsSync(APPLE_ROOT_CA_G3_PATH)) {
+    certs.push(fs.readFileSync(APPLE_ROOT_CA_G3_PATH));
+  }
+
+  if (fs.existsSync(APPLE_ROOT_CA_PATH)) {
+    certs.push(fs.readFileSync(APPLE_ROOT_CA_PATH));
+  }
+
+  if (certs.length === 0) {
+    throw new Error(
+      "Apple root certificate dosyaları bulunamadı. AppleRootCA-G3.cer ve/veya AppleIncRootCertificate.cer ekle."
+    );
+  }
+
+  return certs;
+}
+
+function getAppleEnvironment(environment) {
+  return environment === "production"
+    ? AppleEnvironment.PRODUCTION
+    : AppleEnvironment.SANDBOX;
+}
+
+function getAppleVerifier(environment) {
+  const rootCerts = loadAppleRootCertificates();
+  const appleEnv = getAppleEnvironment(environment);
+
+  return new SignedDataVerifier(
+    rootCerts,
+    true,
+    appleEnv,
+    APPLE_BUNDLE_ID,
+    appleEnv === AppleEnvironment.PRODUCTION ? APPLE_APP_ID : undefined
+  );
+}
+
+async function verifyAppleSignedTransaction(signedTransactionInfo, environment) {
+  if (!signedTransactionInfo) {
+    throw new Error("signedTransactionInfo gerekli.");
+  }
+
+  if (!APPLE_BUNDLE_ID) {
+    throw new Error("APPLE_BUNDLE_ID env eksik.");
+  }
+
+  const verifier = getAppleVerifier(environment);
+  const decoded = await verifier.verifyAndDecodeTransaction(signedTransactionInfo);
+
+  return decoded;
+}
+
+async function getPurchaseByTransactionId(transactionId) {
+  return await getQuery(
+    `SELECT * FROM purchases WHERE transaction_id = ?`,
+    [transactionId]
+  );
+}
+
 app.get("/", (req, res) => {
   res.json({
     success: true,
@@ -429,7 +540,7 @@ app.post("/api/auth/register", async (req, res) => {
 
     const result = await runQuery(
       `INSERT INTO users (email, password_hash, full_name, is_premium, credits)
-       VALUES (?, ?, ?, 0, 5)`,
+       VALUES (?, ?, ?, 0, 0)`,
       [email.trim().toLowerCase(), passwordHash, full_name || null]
     );
 
@@ -500,6 +611,7 @@ app.get("/api/auth/me", authMiddleware, async (req, res) => {
   });
 });
 
+// Test/admin için bırakıyorum. Production'da koru veya kaldır.
 app.post("/api/auth/add-credits", async (req, res) => {
   try {
     const { user_id, amount } = req.body;
@@ -522,6 +634,105 @@ app.post("/api/auth/add-credits", async (req, res) => {
     return res.status(500).json({
       success: false,
       error: error.message
+    });
+  }
+});
+
+// Apple IAP verify
+app.post("/api/purchase/verify", authMiddleware, async (req, res) => {
+  try {
+    const { signedTransactionInfo, productId, environment } = req.body;
+
+    if (!signedTransactionInfo || !productId) {
+      return res.status(400).json({
+        success: false,
+        error: "signedTransactionInfo ve productId gerekli."
+      });
+    }
+
+    if (!CREDIT_PRODUCTS[productId]) {
+      return res.status(400).json({
+        success: false,
+        error: "Geçersiz productId."
+      });
+    }
+
+    const decodedTransaction = await verifyAppleSignedTransaction(
+      signedTransactionInfo,
+      environment || "sandbox"
+    );
+
+    // Apple payload kontrolü
+    if (decodedTransaction.bundleId !== APPLE_BUNDLE_ID) {
+      return res.status(400).json({
+        success: false,
+        error: "Bundle ID uyuşmuyor."
+      });
+    }
+
+    if (decodedTransaction.productId !== productId) {
+      return res.status(400).json({
+        success: false,
+        error: "Product ID uyuşmuyor."
+      });
+    }
+
+    const transactionId = String(decodedTransaction.transactionId);
+    const originalTransactionId = decodedTransaction.originalTransactionId
+      ? String(decodedTransaction.originalTransactionId)
+      : null;
+
+    const existingPurchase = await getPurchaseByTransactionId(transactionId);
+
+    if (existingPurchase) {
+      const user = await getUserById(req.user.id);
+
+      return res.json({
+        success: true,
+        alreadyProcessed: true,
+        user: sanitizeUser(user)
+      });
+    }
+
+    const creditsToAdd = CREDIT_PRODUCTS[productId];
+
+    await runQuery(
+      `INSERT INTO purchases (
+        user_id,
+        product_id,
+        transaction_id,
+        original_transaction_id,
+        credits_added,
+        environment,
+        raw_signed_transaction
+      ) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      [
+        req.user.id,
+        productId,
+        transactionId,
+        originalTransactionId,
+        creditsToAdd,
+        environment || "sandbox",
+        signedTransactionInfo
+      ]
+    );
+
+    await addCredits(req.user.id, creditsToAdd);
+    const updatedUser = await getUserById(req.user.id);
+
+    return res.json({
+      success: true,
+      creditsAdded: creditsToAdd,
+      productId,
+      transactionId,
+      user: sanitizeUser(updatedUser)
+    });
+  } catch (error) {
+    console.error("Purchase verify error:", error.message);
+
+    return res.status(500).json({
+      success: false,
+      error: error.message || "Satın alma doğrulanamadı."
     });
   }
 });
@@ -575,11 +786,14 @@ app.post("/api/generate", authMiddleware, upload.single("image"), async (req, re
       });
     }
 
-    if (user.credits <= 0) {
+    const creditCost = getCreditCostForQuality(quality);
+
+    if (user.credits < creditCost) {
       return res.status(403).json({
         success: false,
         error: "Yetersiz kredi.",
-        credits: user.credits
+        credits: user.credits,
+        requiredCredits: creditCost
       });
     }
 
@@ -650,7 +864,7 @@ app.post("/api/generate", authMiddleware, upload.single("image"), async (req, re
         replicate_prediction_id: finalPrediction.id
       });
 
-      await decrementCredit(user.id);
+      await decrementCredit(user.id, creditCost);
       const updatedUser = await getUserById(user.id);
 
       const finalRow = await getQuery(
@@ -661,7 +875,8 @@ app.post("/api/generate", authMiddleware, upload.single("image"), async (req, re
       return res.json({
         success: true,
         generation: finalRow,
-        user: sanitizeUser(updatedUser)
+        user: sanitizeUser(updatedUser),
+        creditsSpent: creditCost
       });
     }
 
@@ -761,6 +976,28 @@ app.get("/api/credits", authMiddleware, async (req, res) => {
   });
 });
 
+app.get("/api/purchases", authMiddleware, async (req, res) => {
+  try {
+    const rows = await allQuery(
+      `SELECT id, product_id, transaction_id, original_transaction_id, credits_added, environment, created_at
+       FROM purchases
+       WHERE user_id = ?
+       ORDER BY created_at DESC`,
+      [req.user.id]
+    );
+
+    return res.json({
+      success: true,
+      purchases: rows
+    });
+  } catch (error) {
+    return res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
 initDatabase()
   .then(() => {
     console.log("REPLICATE_API_TOKEN exists:", !!process.env.REPLICATE_API_TOKEN);
@@ -768,6 +1005,8 @@ initDatabase()
     console.log("CLOUDINARY_API_KEY exists:", !!process.env.CLOUDINARY_API_KEY);
     console.log("CLOUDINARY_API_SECRET exists:", !!process.env.CLOUDINARY_API_SECRET);
     console.log("JWT_SECRET exists:", !!process.env.JWT_SECRET);
+    console.log("APPLE_BUNDLE_ID exists:", !!process.env.APPLE_BUNDLE_ID);
+    console.log("APPLE_APP_ID exists:", !!process.env.APPLE_APP_ID);
 
     app.listen(PORT, () => {
       console.log(`Server running on port ${PORT}`);
