@@ -8,6 +8,8 @@ const path = require("path");
 const axios = require("axios");
 const sqlite3 = require("sqlite3").verbose();
 const { v2: cloudinary } = require("cloudinary");
+const bcrypt = require("bcryptjs");
+const jwt = require("jsonwebtoken");
 
 const app = express();
 app.use(cors());
@@ -19,6 +21,7 @@ app.use((req, res, next) => {
 });
 
 const PORT = process.env.PORT || 3000;
+const JWT_SECRET = process.env.JWT_SECRET || "change-me";
 const UPLOADS_DIR = path.join(__dirname, "uploads");
 const DB_PATH = path.join(__dirname, "database.sqlite");
 
@@ -80,9 +83,22 @@ function allQuery(sql, params = []) {
 
 async function initDatabase() {
   await runQuery(`
+    CREATE TABLE IF NOT EXISTS users (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      email TEXT NOT NULL UNIQUE,
+      password_hash TEXT NOT NULL,
+      full_name TEXT,
+      is_premium INTEGER NOT NULL DEFAULT 0,
+      credits INTEGER NOT NULL DEFAULT 5,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
+
+  await runQuery(`
     CREATE TABLE IF NOT EXISTS generations (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
-      user_id TEXT NOT NULL,
+      user_id INTEGER NOT NULL,
       motion_type TEXT NOT NULL,
       quality TEXT NOT NULL,
       custom_prompt TEXT,
@@ -95,16 +111,6 @@ async function initDatabase() {
       replicate_prediction_id TEXT,
       created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
       updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
-    )
-  `);
-
-  await runQuery(`
-    CREATE TABLE IF NOT EXISTS user_limits (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      user_id TEXT NOT NULL,
-      limit_date TEXT NOT NULL,
-      generation_count INTEGER NOT NULL DEFAULT 0,
-      UNIQUE(user_id, limit_date)
     )
   `);
 }
@@ -140,57 +146,87 @@ const MOTION_PRESETS = {
   }
 };
 
-function getTodayDateString() {
-  return new Date().toISOString().slice(0, 10);
-}
-
-function getUserDailyLimit(isPremium) {
-  return isPremium
-    ? Number(process.env.PREMIUM_DAILY_LIMIT || 10)
-    : Number(process.env.FREE_DAILY_LIMIT || 2);
-}
-
-async function getUserLimitRow(userId, dateStr) {
-  let row = await getQuery(
-    `SELECT * FROM user_limits WHERE user_id = ? AND limit_date = ?`,
-    [userId, dateStr]
+function createToken(user) {
+  return jwt.sign(
+    {
+      id: user.id,
+      email: user.email
+    },
+    JWT_SECRET,
+    { expiresIn: "30d" }
   );
-
-  if (!row) {
-    await runQuery(
-      `INSERT INTO user_limits (user_id, limit_date, generation_count) VALUES (?, ?, 0)`,
-      [userId, dateStr]
-    );
-    row = await getQuery(
-      `SELECT * FROM user_limits WHERE user_id = ? AND limit_date = ?`,
-      [userId, dateStr]
-    );
-  }
-
-  return row;
 }
 
-async function checkUserCanGenerate(userId, isPremium) {
-  const today = getTodayDateString();
-  const row = await getUserLimitRow(userId, today);
-  const allowedLimit = getUserDailyLimit(isPremium);
+async function getUserById(id) {
+  return await getQuery(`SELECT * FROM users WHERE id = ?`, [id]);
+}
 
+async function getUserByEmail(email) {
+  return await getQuery(`SELECT * FROM users WHERE email = ?`, [email]);
+}
+
+function sanitizeUser(user) {
+  if (!user) return null;
   return {
-    canGenerate: row.generation_count < allowedLimit,
-    currentCount: row.generation_count,
-    allowedLimit
+    id: user.id,
+    email: user.email,
+    full_name: user.full_name,
+    is_premium: !!user.is_premium,
+    credits: user.credits,
+    created_at: user.created_at,
+    updated_at: user.updated_at
   };
 }
 
-async function incrementUserDailyCount(userId) {
-  const today = getTodayDateString();
-  await getUserLimitRow(userId, today);
+async function authMiddleware(req, res, next) {
+  try {
+    const authHeader = req.headers.authorization || "";
 
+    if (!authHeader.startsWith("Bearer ")) {
+      return res.status(401).json({
+        success: false,
+        error: "Authorization token gerekli."
+      });
+    }
+
+    const token = authHeader.split(" ")[1];
+    const decoded = jwt.verify(token, JWT_SECRET);
+    const user = await getUserById(decoded.id);
+
+    if (!user) {
+      return res.status(401).json({
+        success: false,
+        error: "Kullanıcı bulunamadı."
+      });
+    }
+
+    req.user = user;
+    next();
+  } catch (error) {
+    return res.status(401).json({
+      success: false,
+      error: "Geçersiz veya süresi dolmuş token."
+    });
+  }
+}
+
+async function decrementCredit(userId) {
   await runQuery(
-    `UPDATE user_limits
-     SET generation_count = generation_count + 1
-     WHERE user_id = ? AND limit_date = ?`,
-    [userId, today]
+    `UPDATE users
+     SET credits = credits - 1,
+         updated_at = CURRENT_TIMESTAMP
+     WHERE id = ? AND credits > 0`,
+    [userId]
+  );
+}
+
+async function addCredits(userId, amount) {
+  await runQuery(
+    `UPDATE users
+     SET credits = credits + ?,
+         updated_at = CURRENT_TIMESTAMP
+     WHERE id = ?`,
+    [amount, userId]
   );
 }
 
@@ -362,6 +398,134 @@ app.get("/", (req, res) => {
   });
 });
 
+app.post("/api/auth/register", async (req, res) => {
+  try {
+    const { email, password, full_name } = req.body;
+
+    if (!email || !password) {
+      return res.status(400).json({
+        success: false,
+        error: "email ve password gerekli."
+      });
+    }
+
+    if (password.length < 6) {
+      return res.status(400).json({
+        success: false,
+        error: "Şifre en az 6 karakter olmalı."
+      });
+    }
+
+    const existingUser = await getUserByEmail(email.trim().toLowerCase());
+
+    if (existingUser) {
+      return res.status(400).json({
+        success: false,
+        error: "Bu email zaten kayıtlı."
+      });
+    }
+
+    const passwordHash = await bcrypt.hash(password, 10);
+
+    const result = await runQuery(
+      `INSERT INTO users (email, password_hash, full_name, is_premium, credits)
+       VALUES (?, ?, ?, 0, 5)`,
+      [email.trim().toLowerCase(), passwordHash, full_name || null]
+    );
+
+    const user = await getUserById(result.lastID);
+    const token = createToken(user);
+
+    return res.json({
+      success: true,
+      token,
+      user: sanitizeUser(user)
+    });
+  } catch (error) {
+    return res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+app.post("/api/auth/login", async (req, res) => {
+  try {
+    const { email, password } = req.body;
+
+    if (!email || !password) {
+      return res.status(400).json({
+        success: false,
+        error: "email ve password gerekli."
+      });
+    }
+
+    const user = await getUserByEmail(email.trim().toLowerCase());
+
+    if (!user) {
+      return res.status(401).json({
+        success: false,
+        error: "Email veya şifre hatalı."
+      });
+    }
+
+    const isMatch = await bcrypt.compare(password, user.password_hash);
+
+    if (!isMatch) {
+      return res.status(401).json({
+        success: false,
+        error: "Email veya şifre hatalı."
+      });
+    }
+
+    const token = createToken(user);
+
+    return res.json({
+      success: true,
+      token,
+      user: sanitizeUser(user)
+    });
+  } catch (error) {
+    return res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+app.get("/api/auth/me", authMiddleware, async (req, res) => {
+  return res.json({
+    success: true,
+    user: sanitizeUser(req.user)
+  });
+});
+
+app.post("/api/auth/add-credits", async (req, res) => {
+  try {
+    const { user_id, amount } = req.body;
+
+    if (!user_id || !amount) {
+      return res.status(400).json({
+        success: false,
+        error: "user_id ve amount gerekli."
+      });
+    }
+
+    await addCredits(user_id, Number(amount));
+    const user = await getUserById(user_id);
+
+    return res.json({
+      success: true,
+      user: sanitizeUser(user)
+    });
+  } catch (error) {
+    return res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
 app.get("/api/presets", (req, res) => {
   const presets = Object.entries(MOTION_PRESETS).map(([key, value]) => ({
     key,
@@ -376,15 +540,17 @@ app.get("/api/presets", (req, res) => {
   });
 });
 
-app.post("/api/generate", upload.single("image"), async (req, res) => {
+app.post("/api/generate", authMiddleware, upload.single("image"), async (req, res) => {
   let uploadedFilePath = null;
 
   try {
     console.log("POST /api/generate hit");
     console.log("Body:", req.body);
     console.log("File:", req.file ? req.file.originalname : "NO_FILE");
+    console.log("User:", req.user.id);
 
-    const { motionType, user_id, is_premium, quality, customPrompt } = req.body;
+    const { motionType, quality, customPrompt } = req.body;
+    const user = req.user;
 
     if (!req.file) {
       return res.status(400).json({
@@ -394,13 +560,6 @@ app.post("/api/generate", upload.single("image"), async (req, res) => {
     }
 
     uploadedFilePath = req.file.path;
-
-    if (!user_id) {
-      return res.status(400).json({
-        success: false,
-        error: "user_id gerekli."
-      });
-    }
 
     if (!motionType || !MOTION_PRESETS[motionType]) {
       return res.status(400).json({
@@ -416,20 +575,11 @@ app.post("/api/generate", upload.single("image"), async (req, res) => {
       });
     }
 
-    const isPremiumUser =
-      is_premium === true ||
-      is_premium === "true" ||
-      is_premium === 1 ||
-      is_premium === "1";
-
-    const limitInfo = await checkUserCanGenerate(user_id, isPremiumUser);
-
-    if (!limitInfo.canGenerate) {
-      return res.status(429).json({
+    if (user.credits <= 0) {
+      return res.status(403).json({
         success: false,
-        error: "Günlük üretim limitine ulaşıldı.",
-        dailyUsed: limitInfo.currentCount,
-        dailyLimit: limitInfo.allowedLimit
+        error: "Yetersiz kredi.",
+        credits: user.credits
       });
     }
 
@@ -448,7 +598,7 @@ app.post("/api/generate", upload.single("image"), async (req, res) => {
         status
       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
       [
-        user_id,
+        user.id,
         motionType,
         quality,
         customPrompt || null,
@@ -500,7 +650,8 @@ app.post("/api/generate", upload.single("image"), async (req, res) => {
         replicate_prediction_id: finalPrediction.id
       });
 
-      await incrementUserDailyCount(user_id);
+      await decrementCredit(user.id);
+      const updatedUser = await getUserById(user.id);
 
       const finalRow = await getQuery(
         `SELECT * FROM generations WHERE id = ?`,
@@ -510,8 +661,7 @@ app.post("/api/generate", upload.single("image"), async (req, res) => {
       return res.json({
         success: true,
         generation: finalRow,
-        dailyUsed: limitInfo.currentCount + 1,
-        dailyLimit: limitInfo.allowedLimit
+        user: sanitizeUser(updatedUser)
       });
     }
 
@@ -556,11 +706,11 @@ app.post("/api/generate", upload.single("image"), async (req, res) => {
   }
 });
 
-app.get("/api/generation/:id", async (req, res) => {
+app.get("/api/generation/:id", authMiddleware, async (req, res) => {
   try {
     const row = await getQuery(
-      `SELECT * FROM generations WHERE id = ?`,
-      [req.params.id]
+      `SELECT * FROM generations WHERE id = ? AND user_id = ?`,
+      [req.params.id, req.user.id]
     );
 
     if (!row) {
@@ -582,11 +732,11 @@ app.get("/api/generation/:id", async (req, res) => {
   }
 });
 
-app.get("/api/generations/:userId", async (req, res) => {
+app.get("/api/generations", authMiddleware, async (req, res) => {
   try {
     const rows = await allQuery(
       `SELECT * FROM generations WHERE user_id = ? ORDER BY created_at DESC`,
-      [req.params.userId]
+      [req.user.id]
     );
 
     return res.json({
@@ -601,30 +751,14 @@ app.get("/api/generations/:userId", async (req, res) => {
   }
 });
 
-app.get("/api/usage/:userId", async (req, res) => {
-  try {
-    const isPremium =
-      req.query.is_premium === "true" ||
-      req.query.is_premium === "1";
+app.get("/api/credits", authMiddleware, async (req, res) => {
+  const user = await getUserById(req.user.id);
 
-    const today = getTodayDateString();
-    const row = await getUserLimitRow(req.params.userId, today);
-    const dailyLimit = getUserDailyLimit(isPremium);
-
-    return res.json({
-      success: true,
-      user_id: req.params.userId,
-      date: today,
-      used: row.generation_count,
-      limit: dailyLimit,
-      remaining: Math.max(0, dailyLimit - row.generation_count)
-    });
-  } catch (error) {
-    return res.status(500).json({
-      success: false,
-      error: error.message
-    });
-  }
+  return res.json({
+    success: true,
+    credits: user.credits,
+    is_premium: !!user.is_premium
+  });
 });
 
 initDatabase()
@@ -633,6 +767,7 @@ initDatabase()
     console.log("CLOUDINARY_CLOUD_NAME exists:", !!process.env.CLOUDINARY_CLOUD_NAME);
     console.log("CLOUDINARY_API_KEY exists:", !!process.env.CLOUDINARY_API_KEY);
     console.log("CLOUDINARY_API_SECRET exists:", !!process.env.CLOUDINARY_API_SECRET);
+    console.log("JWT_SECRET exists:", !!process.env.JWT_SECRET);
 
     app.listen(PORT, () => {
       console.log(`Server running on port ${PORT}`);
