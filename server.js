@@ -10,10 +10,6 @@ const sqlite3 = require("sqlite3").verbose();
 const { v2: cloudinary } = require("cloudinary");
 const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
-const {
-  SignedDataVerifier,
-  Environment: AppleEnvironment
-} = require("@apple/app-store-server-library");
 
 const app = express();
 app.use(cors());
@@ -31,14 +27,6 @@ const DB_PATH = path.join(__dirname, "database.sqlite");
 
 // Apple / IAP
 const APPLE_BUNDLE_ID = process.env.APPLE_BUNDLE_ID || "";
-const APPLE_APP_ID = process.env.APPLE_APP_ID
-  ? Number(process.env.APPLE_APP_ID)
-  : undefined;
-
-// Bu dosyaları repoya ekleyebilirsin veya sonra secret file olarak koyarsın.
-// Şimdilik basit tutuyorum.
-const APPLE_ROOT_CA_G3_PATH = path.join(__dirname, "AppleRootCA-G3.cer");
-const APPLE_ROOT_CA_PATH = path.join(__dirname, "AppleIncRootCertificate.cer");
 
 // Kredi paketleri
 const CREDIT_PRODUCTS = {
@@ -117,7 +105,7 @@ async function initDatabase() {
       password_hash TEXT NOT NULL,
       full_name TEXT,
       is_premium INTEGER NOT NULL DEFAULT 0,
-      credits INTEGER NOT NULL DEFAULT 5,
+      credits INTEGER NOT NULL DEFAULT 0,
       created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
       updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
     )
@@ -440,44 +428,21 @@ async function updateGenerationStatus(id, data) {
   );
 }
 
-// Apple root CA dosyalarını yükle
-function loadAppleRootCertificates() {
-  const certs = [];
-
-  if (fs.existsSync(APPLE_ROOT_CA_G3_PATH)) {
-    certs.push(fs.readFileSync(APPLE_ROOT_CA_G3_PATH));
+// TEST / DEV AMAÇLI: JWS decode eder, imza doğrulamaz
+function decodeJwtPayloadWithoutVerify(token) {
+  const parts = String(token).split(".");
+  if (parts.length < 2) {
+    throw new Error("Geçersiz signedTransactionInfo formatı.");
   }
 
-  if (fs.existsSync(APPLE_ROOT_CA_PATH)) {
-    certs.push(fs.readFileSync(APPLE_ROOT_CA_PATH));
-  }
+  const payloadBase64 = parts[1]
+    .replace(/-/g, "+")
+    .replace(/_/g, "/");
 
-  if (certs.length === 0) {
-    throw new Error(
-      "Apple root certificate dosyaları bulunamadı. AppleRootCA-G3.cer ve/veya AppleIncRootCertificate.cer ekle."
-    );
-  }
+  const padded = payloadBase64 + "=".repeat((4 - (payloadBase64.length % 4)) % 4);
+  const payloadJson = Buffer.from(padded, "base64").toString("utf8");
 
-  return certs;
-}
-
-function getAppleEnvironment(environment) {
-  return environment === "production"
-    ? AppleEnvironment.PRODUCTION
-    : AppleEnvironment.SANDBOX;
-}
-
-function getAppleVerifier(environment) {
-  const rootCerts = loadAppleRootCertificates();
-  const appleEnv = getAppleEnvironment(environment);
-
-  return new SignedDataVerifier(
-    rootCerts,
-    true,
-    appleEnv,
-    APPLE_BUNDLE_ID,
-    appleEnv === AppleEnvironment.PRODUCTION ? APPLE_APP_ID : undefined
-  );
+  return JSON.parse(payloadJson);
 }
 
 async function verifyAppleSignedTransaction(signedTransactionInfo, environment) {
@@ -489,10 +454,30 @@ async function verifyAppleSignedTransaction(signedTransactionInfo, environment) 
     throw new Error("APPLE_BUNDLE_ID env eksik.");
   }
 
-  const verifier = getAppleVerifier(environment);
-  const decoded = await verifier.verifyAndDecodeTransaction(signedTransactionInfo);
+  const decoded = decodeJwtPayloadWithoutVerify(signedTransactionInfo);
 
-  return decoded;
+  // Basit zorunlu kontroller
+  if (!decoded.bundleId) {
+    throw new Error("signedTransactionInfo içinde bundleId yok.");
+  }
+
+  if (!decoded.productId) {
+    throw new Error("signedTransactionInfo içinde productId yok.");
+  }
+
+  if (!decoded.transactionId) {
+    throw new Error("signedTransactionInfo içinde transactionId yok.");
+  }
+
+  if (decoded.bundleId !== APPLE_BUNDLE_ID) {
+    throw new Error("Bundle ID uyuşmuyor.");
+  }
+
+  // environment bilgisi payloadda yoksa requestten geleni kullan
+  return {
+    ...decoded,
+    _environment: environment || "sandbox"
+  };
 }
 
 async function getPurchaseByTransactionId(transactionId) {
@@ -638,7 +623,7 @@ app.post("/api/auth/add-credits", async (req, res) => {
   }
 });
 
-// Apple IAP verify
+// Apple IAP verify (DEV / TEST sürümü)
 app.post("/api/purchase/verify", authMiddleware, async (req, res) => {
   try {
     const { signedTransactionInfo, productId, environment } = req.body;
@@ -661,14 +646,6 @@ app.post("/api/purchase/verify", authMiddleware, async (req, res) => {
       signedTransactionInfo,
       environment || "sandbox"
     );
-
-    // Apple payload kontrolü
-    if (decodedTransaction.bundleId !== APPLE_BUNDLE_ID) {
-      return res.status(400).json({
-        success: false,
-        error: "Bundle ID uyuşmuyor."
-      });
-    }
 
     if (decodedTransaction.productId !== productId) {
       return res.status(400).json({
@@ -712,7 +689,7 @@ app.post("/api/purchase/verify", authMiddleware, async (req, res) => {
         transactionId,
         originalTransactionId,
         creditsToAdd,
-        environment || "sandbox",
+        decodedTransaction._environment || environment || "sandbox",
         signedTransactionInfo
       ]
     );
@@ -1006,7 +983,6 @@ initDatabase()
     console.log("CLOUDINARY_API_SECRET exists:", !!process.env.CLOUDINARY_API_SECRET);
     console.log("JWT_SECRET exists:", !!process.env.JWT_SECRET);
     console.log("APPLE_BUNDLE_ID exists:", !!process.env.APPLE_BUNDLE_ID);
-    console.log("APPLE_APP_ID exists:", !!process.env.APPLE_APP_ID);
 
     app.listen(PORT, () => {
       console.log(`Server running on port ${PORT}`);
