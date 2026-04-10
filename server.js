@@ -29,7 +29,7 @@ const APPLE_BUNDLE_ID = process.env.APPLE_BUNDLE_ID || "";
 const APPLE_SHARED_SECRET = process.env.APPLE_SHARED_SECRET || "";
 
 const CREDIT_PRODUCTS = {
-  credits_10: 10,
+  credits_10_old: 10,
 };
 
 const QUALITY_COSTS = {
