@@ -618,32 +618,6 @@ app.get("/api/auth/me", authMiddleware, async (req, res) => {
   });
 });
 
-// Test/admin için. Production'da koru veya kaldır.
-app.post("/api/auth/add-credits", async (req, res) => {
-  try {
-    const { user_id, amount } = req.body;
-
-    if (!user_id || !amount) {
-      return res.status(400).json({
-        success: false,
-        error: "user_id ve amount gerekli."
-      });
-    }
-
-    await addCredits(user_id, Number(amount));
-    const user = await getUserById(user_id);
-
-    return res.json({
-      success: true,
-      user: sanitizeUser(user)
-    });
-  } catch (error) {
-    return res.status(500).json({
-      success: false,
-      error: error.message
-    });
-  }
-});
 
 // Apple IAP verify - production için receiptData kullanır
 app.post("/api/purchase/verify", authMiddleware, async (req, res) => {
