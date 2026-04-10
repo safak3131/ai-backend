@@ -29,7 +29,7 @@ const APPLE_BUNDLE_ID = process.env.APPLE_BUNDLE_ID || "";
 const APPLE_SHARED_SECRET = process.env.APPLE_SHARED_SECRET || "";
 
 const CREDIT_PRODUCTS = {
-  credits_10_old: 10,
+  credits_10_old: 10
 };
 
 const QUALITY_COSTS = {
@@ -126,8 +126,6 @@ async function initDatabase() {
     )
   `);
 
-  // raw_signed_transaction kolon adını koruyorum ki mevcut DB bozulmasın.
-  // Artık burada receiptData saklanacak.
   await runQuery(`
     CREATE TABLE IF NOT EXISTS purchases (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -438,7 +436,6 @@ async function verifyReceiptWithApple(receiptData) {
     throw new Error("APPLE_SHARED_SECRET env eksik.");
   }
 
-  // Önce production'a gönder
   const prodResponse = await axios.post(
     "https://buy.itunes.apple.com/verifyReceipt",
     {
@@ -454,7 +451,6 @@ async function verifyReceiptWithApple(receiptData) {
     }
   );
 
-  // Sandbox receipt production'a geldiyse
   if (prodResponse.data?.status === 21007) {
     const sandboxResponse = await axios.post(
       "https://sandbox.itunes.apple.com/verifyReceipt",
@@ -618,11 +614,15 @@ app.get("/api/auth/me", authMiddleware, async (req, res) => {
   });
 });
 
-
-// Apple IAP verify - production için receiptData kullanır
 app.post("/api/purchase/verify", authMiddleware, async (req, res) => {
   try {
     const { receiptData, productId } = req.body;
+
+    console.log("📦 Incoming purchase request");
+    console.log("receiptData exists:", !!receiptData);
+    console.log("productId from client:", productId);
+    console.log("APPLE_BUNDLE_ID:", APPLE_BUNDLE_ID);
+    console.log("APPLE_SHARED_SECRET exists:", !!APPLE_SHARED_SECRET);
 
     if (!receiptData || !productId) {
       return res.status(400).json({
@@ -640,6 +640,8 @@ app.post("/api/purchase/verify", authMiddleware, async (req, res) => {
 
     const { environment, data } = await verifyReceiptWithApple(receiptData);
 
+    console.log("🍎 Apple verify response:", JSON.stringify(data, null, 2));
+
     if (data.status !== 0) {
       return res.status(400).json({
         success: false,
@@ -649,6 +651,8 @@ app.post("/api/purchase/verify", authMiddleware, async (req, res) => {
     }
 
     const receiptBundleId = data.receipt?.bundle_id;
+
+    console.log("📱 Receipt bundle id:", receiptBundleId);
 
     if (!receiptBundleId) {
       return res.status(400).json({
@@ -666,6 +670,8 @@ app.post("/api/purchase/verify", authMiddleware, async (req, res) => {
 
     const matchedItem = pickMatchingReceiptItem(data, productId);
 
+    console.log("🎯 matchedItem:", matchedItem);
+
     if (!matchedItem) {
       return res.status(400).json({
         success: false,
@@ -678,9 +684,14 @@ app.post("/api/purchase/verify", authMiddleware, async (req, res) => {
       ? String(matchedItem.original_transaction_id)
       : null;
 
+    console.log("🧾 transactionId:", transactionId);
+    console.log("🧾 originalTransactionId:", originalTransactionId);
+
     const existingPurchase = await getPurchaseByTransactionId(transactionId);
 
     if (existingPurchase) {
+      console.log("♻️ Purchase already processed:", transactionId);
+
       const user = await getUserById(req.user.id);
 
       return res.json({
@@ -691,6 +702,8 @@ app.post("/api/purchase/verify", authMiddleware, async (req, res) => {
     }
 
     const creditsToAdd = CREDIT_PRODUCTS[productId];
+
+    console.log("💰 creditsToAdd:", creditsToAdd);
 
     await runQuery(
       `INSERT INTO purchases (
@@ -715,6 +728,8 @@ app.post("/api/purchase/verify", authMiddleware, async (req, res) => {
 
     await addCredits(req.user.id, creditsToAdd);
     const updatedUser = await getUserById(req.user.id);
+
+    console.log("✅ Credits added. New balance:", updatedUser?.credits);
 
     return res.json({
       success: true,
