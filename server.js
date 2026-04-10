@@ -30,8 +30,6 @@ const APPLE_SHARED_SECRET = process.env.APPLE_SHARED_SECRET || "";
 
 const CREDIT_PRODUCTS = {
   credits_10: 10,
-  credits_30: 35,
-  credits_100: 120
 };
 
 const QUALITY_COSTS = {
