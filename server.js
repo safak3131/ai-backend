@@ -25,17 +25,15 @@ const JWT_SECRET = process.env.JWT_SECRET || "change-me";
 const UPLOADS_DIR = path.join(__dirname, "uploads");
 const DB_PATH = path.join(__dirname, "database.sqlite");
 
-// Apple / IAP
 const APPLE_BUNDLE_ID = process.env.APPLE_BUNDLE_ID || "";
+const APPLE_SHARED_SECRET = process.env.APPLE_SHARED_SECRET || "";
 
-// Kredi paketleri
 const CREDIT_PRODUCTS = {
   credits_10: 10,
   credits_30: 35,
   credits_100: 120
 };
 
-// Video maliyeti
 const QUALITY_COSTS = {
   low: 1,
   high: 3
@@ -130,6 +128,8 @@ async function initDatabase() {
     )
   `);
 
+  // raw_signed_transaction kolon adını koruyorum ki mevcut DB bozulmasın.
+  // Artık burada receiptData saklanacak.
   await runQuery(`
     CREATE TABLE IF NOT EXISTS purchases (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -428,63 +428,87 @@ async function updateGenerationStatus(id, data) {
   );
 }
 
-// TEST / DEV AMAÇLI: JWS decode eder, imza doğrulamaz
-function decodeJwtPayloadWithoutVerify(token) {
-  const parts = String(token).split(".");
-  if (parts.length < 2) {
-    throw new Error("Geçersiz signedTransactionInfo formatı.");
-  }
-
-  const payloadBase64 = parts[1]
-    .replace(/-/g, "+")
-    .replace(/_/g, "/");
-
-  const padded = payloadBase64 + "=".repeat((4 - (payloadBase64.length % 4)) % 4);
-  const payloadJson = Buffer.from(padded, "base64").toString("utf8");
-
-  return JSON.parse(payloadJson);
-}
-
-async function verifyAppleSignedTransaction(signedTransactionInfo, environment) {
-  if (!signedTransactionInfo) {
-    throw new Error("signedTransactionInfo gerekli.");
-  }
-
-  if (!APPLE_BUNDLE_ID) {
-    throw new Error("APPLE_BUNDLE_ID env eksik.");
-  }
-
-  const decoded = decodeJwtPayloadWithoutVerify(signedTransactionInfo);
-
-  // Basit zorunlu kontroller
-  if (!decoded.bundleId) {
-    throw new Error("signedTransactionInfo içinde bundleId yok.");
-  }
-
-  if (!decoded.productId) {
-    throw new Error("signedTransactionInfo içinde productId yok.");
-  }
-
-  if (!decoded.transactionId) {
-    throw new Error("signedTransactionInfo içinde transactionId yok.");
-  }
-
-  if (decoded.bundleId !== APPLE_BUNDLE_ID) {
-    throw new Error("Bundle ID uyuşmuyor.");
-  }
-
-  // environment bilgisi payloadda yoksa requestten geleni kullan
-  return {
-    ...decoded,
-    _environment: environment || "sandbox"
-  };
-}
-
 async function getPurchaseByTransactionId(transactionId) {
   return await getQuery(
     `SELECT * FROM purchases WHERE transaction_id = ?`,
     [transactionId]
   );
+}
+
+async function verifyReceiptWithApple(receiptData) {
+  if (!APPLE_SHARED_SECRET) {
+    throw new Error("APPLE_SHARED_SECRET env eksik.");
+  }
+
+  // Önce production'a gönder
+  const prodResponse = await axios.post(
+    "https://buy.itunes.apple.com/verifyReceipt",
+    {
+      "receipt-data": receiptData,
+      password: APPLE_SHARED_SECRET,
+      "exclude-old-transactions": true
+    },
+    {
+      headers: {
+        "Content-Type": "application/json"
+      },
+      timeout: 30000
+    }
+  );
+
+  // Sandbox receipt production'a geldiyse
+  if (prodResponse.data?.status === 21007) {
+    const sandboxResponse = await axios.post(
+      "https://sandbox.itunes.apple.com/verifyReceipt",
+      {
+        "receipt-data": receiptData,
+        password: APPLE_SHARED_SECRET,
+        "exclude-old-transactions": true
+      },
+      {
+        headers: {
+          "Content-Type": "application/json"
+        },
+        timeout: 30000
+      }
+    );
+
+    return {
+      environment: "sandbox",
+      data: sandboxResponse.data
+    };
+  }
+
+  return {
+    environment: "production",
+    data: prodResponse.data
+  };
+}
+
+function pickMatchingReceiptItem(verifyData, productId) {
+  const latest = Array.isArray(verifyData.latest_receipt_info)
+    ? verifyData.latest_receipt_info
+    : [];
+
+  const inApp = Array.isArray(verifyData.receipt?.in_app)
+    ? verifyData.receipt.in_app
+    : [];
+
+  const merged = [...latest, ...inApp].filter(
+    (item) => item && item.product_id === productId && item.transaction_id
+  );
+
+  if (merged.length === 0) {
+    return null;
+  }
+
+  merged.sort((a, b) => {
+    const aTime = Number(a.purchase_date_ms || 0);
+    const bTime = Number(b.purchase_date_ms || 0);
+    return bTime - aTime;
+  });
+
+  return merged[0];
 }
 
 app.get("/", (req, res) => {
@@ -596,7 +620,7 @@ app.get("/api/auth/me", authMiddleware, async (req, res) => {
   });
 });
 
-// Test/admin için bırakıyorum. Production'da koru veya kaldır.
+// Test/admin için. Production'da koru veya kaldır.
 app.post("/api/auth/add-credits", async (req, res) => {
   try {
     const { user_id, amount } = req.body;
@@ -623,15 +647,15 @@ app.post("/api/auth/add-credits", async (req, res) => {
   }
 });
 
-// Apple IAP verify (DEV / TEST sürümü)
+// Apple IAP verify - production için receiptData kullanır
 app.post("/api/purchase/verify", authMiddleware, async (req, res) => {
   try {
-    const { signedTransactionInfo, productId, environment } = req.body;
+    const { receiptData, productId } = req.body;
 
-    if (!signedTransactionInfo || !productId) {
+    if (!receiptData || !productId) {
       return res.status(400).json({
         success: false,
-        error: "signedTransactionInfo ve productId gerekli."
+        error: "receiptData ve productId gerekli."
       });
     }
 
@@ -642,21 +666,44 @@ app.post("/api/purchase/verify", authMiddleware, async (req, res) => {
       });
     }
 
-    const decodedTransaction = await verifyAppleSignedTransaction(
-      signedTransactionInfo,
-      environment || "sandbox"
-    );
+    const { environment, data } = await verifyReceiptWithApple(receiptData);
 
-    if (decodedTransaction.productId !== productId) {
+    if (data.status !== 0) {
       return res.status(400).json({
         success: false,
-        error: "Product ID uyuşmuyor."
+        error: "Apple doğrulama başarısız.",
+        appleStatus: data.status
       });
     }
 
-    const transactionId = String(decodedTransaction.transactionId);
-    const originalTransactionId = decodedTransaction.originalTransactionId
-      ? String(decodedTransaction.originalTransactionId)
+    const receiptBundleId = data.receipt?.bundle_id;
+
+    if (!receiptBundleId) {
+      return res.status(400).json({
+        success: false,
+        error: "Receipt bundle_id bulunamadı."
+      });
+    }
+
+    if (receiptBundleId !== APPLE_BUNDLE_ID) {
+      return res.status(400).json({
+        success: false,
+        error: "Bundle ID uyuşmuyor."
+      });
+    }
+
+    const matchedItem = pickMatchingReceiptItem(data, productId);
+
+    if (!matchedItem) {
+      return res.status(400).json({
+        success: false,
+        error: "Bu productId için geçerli satın alma kaydı bulunamadı."
+      });
+    }
+
+    const transactionId = String(matchedItem.transaction_id);
+    const originalTransactionId = matchedItem.original_transaction_id
+      ? String(matchedItem.original_transaction_id)
       : null;
 
     const existingPurchase = await getPurchaseByTransactionId(transactionId);
@@ -689,8 +736,8 @@ app.post("/api/purchase/verify", authMiddleware, async (req, res) => {
         transactionId,
         originalTransactionId,
         creditsToAdd,
-        decodedTransaction._environment || environment || "sandbox",
-        signedTransactionInfo
+        environment,
+        receiptData
       ]
     );
 
@@ -702,10 +749,11 @@ app.post("/api/purchase/verify", authMiddleware, async (req, res) => {
       creditsAdded: creditsToAdd,
       productId,
       transactionId,
+      environment,
       user: sanitizeUser(updatedUser)
     });
   } catch (error) {
-    console.error("Purchase verify error:", error.message);
+    console.error("Purchase verify error:", error.response?.data || error.message);
 
     return res.status(500).json({
       success: false,
@@ -983,6 +1031,7 @@ initDatabase()
     console.log("CLOUDINARY_API_SECRET exists:", !!process.env.CLOUDINARY_API_SECRET);
     console.log("JWT_SECRET exists:", !!process.env.JWT_SECRET);
     console.log("APPLE_BUNDLE_ID exists:", !!process.env.APPLE_BUNDLE_ID);
+    console.log("APPLE_SHARED_SECRET exists:", !!process.env.APPLE_SHARED_SECRET);
 
     app.listen(PORT, () => {
       console.log(`Server running on port ${PORT}`);
