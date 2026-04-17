@@ -6,7 +6,7 @@ const multer = require("multer");
 const fs = require("fs");
 const path = require("path");
 const axios = require("axios");
-const sqlite3 = require("sqlite3").verbose();
+const { Pool } = require("pg");
 const { v2: cloudinary } = require("cloudinary");
 const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
@@ -22,8 +22,8 @@ app.use((req, res, next) => {
 
 const PORT = process.env.PORT || 3000;
 const JWT_SECRET = process.env.JWT_SECRET || "change-me";
+const DATABASE_URL = process.env.DATABASE_URL || "";
 const UPLOADS_DIR = path.join(__dirname, "uploads");
-const DB_PATH = path.join(__dirname, "database.sqlite");
 
 const APPLE_BUNDLE_ID = process.env.APPLE_BUNDLE_ID || "";
 const APPLE_SHARED_SECRET = process.env.APPLE_SHARED_SECRET || "";
@@ -36,6 +36,18 @@ const QUALITY_COSTS = {
   low: 1,
   high: 3
 };
+
+if (!DATABASE_URL) {
+  console.error("DATABASE_URL env eksik.");
+  process.exit(1);
+}
+
+const pool = new Pool({
+  connectionString: DATABASE_URL,
+  ssl: {
+    rejectUnauthorized: false
+  }
+});
 
 cloudinary.config({
   cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
@@ -64,53 +76,38 @@ const upload = multer({
   }
 });
 
-const db = new sqlite3.Database(DB_PATH);
-
-function runQuery(sql, params = []) {
-  return new Promise((resolve, reject) => {
-    db.run(sql, params, function (err) {
-      if (err) return reject(err);
-      resolve(this);
-    });
-  });
+async function runQuery(sql, params = []) {
+  return await pool.query(sql, params);
 }
 
-function getQuery(sql, params = []) {
-  return new Promise((resolve, reject) => {
-    db.get(sql, params, function (err, row) {
-      if (err) return reject(err);
-      resolve(row);
-    });
-  });
+async function getQuery(sql, params = []) {
+  const result = await pool.query(sql, params);
+  return result.rows[0] || null;
 }
 
-function allQuery(sql, params = []) {
-  return new Promise((resolve, reject) => {
-    db.all(sql, params, function (err, rows) {
-      if (err) return reject(err);
-      resolve(rows);
-    });
-  });
+async function allQuery(sql, params = []) {
+  const result = await pool.query(sql, params);
+  return result.rows;
 }
 
 async function initDatabase() {
   await runQuery(`
     CREATE TABLE IF NOT EXISTS users (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      id SERIAL PRIMARY KEY,
       email TEXT NOT NULL UNIQUE,
       password_hash TEXT NOT NULL,
       full_name TEXT,
       is_premium INTEGER NOT NULL DEFAULT 0,
       credits INTEGER NOT NULL DEFAULT 0,
-      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-      updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )
   `);
 
   await runQuery(`
     CREATE TABLE IF NOT EXISTS generations (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      user_id INTEGER NOT NULL,
+      id SERIAL PRIMARY KEY,
+      user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
       motion_type TEXT NOT NULL,
       quality TEXT NOT NULL,
       custom_prompt TEXT,
@@ -121,23 +118,33 @@ async function initDatabase() {
       output_video_url TEXT,
       error_message TEXT,
       replicate_prediction_id TEXT,
-      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-      updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )
   `);
 
   await runQuery(`
     CREATE TABLE IF NOT EXISTS purchases (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      user_id INTEGER NOT NULL,
+      id SERIAL PRIMARY KEY,
+      user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
       product_id TEXT NOT NULL,
       transaction_id TEXT NOT NULL UNIQUE,
       original_transaction_id TEXT,
       credits_added INTEGER NOT NULL DEFAULT 0,
       environment TEXT,
       raw_signed_transaction TEXT,
-      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )
+  `);
+
+  await runQuery(`
+    CREATE INDEX IF NOT EXISTS idx_generations_user_id
+    ON generations(user_id)
+  `);
+
+  await runQuery(`
+    CREATE INDEX IF NOT EXISTS idx_purchases_user_id
+    ON purchases(user_id)
   `);
 }
 
@@ -184,15 +191,16 @@ function createToken(user) {
 }
 
 async function getUserById(id) {
-  return await getQuery(`SELECT * FROM users WHERE id = ?`, [id]);
+  return await getQuery(`SELECT * FROM users WHERE id = $1`, [id]);
 }
 
 async function getUserByEmail(email) {
-  return await getQuery(`SELECT * FROM users WHERE email = ?`, [email]);
+  return await getQuery(`SELECT * FROM users WHERE email = $1`, [email]);
 }
 
 function sanitizeUser(user) {
   if (!user) return null;
+
   return {
     id: user.id,
     email: user.email,
@@ -240,27 +248,42 @@ function getCreditCostForQuality(quality) {
   if (!QUALITY_COSTS[quality]) {
     throw new Error("Geçersiz quality.");
   }
+
   return QUALITY_COSTS[quality];
 }
 
 async function decrementCredit(userId, amount) {
-  await runQuery(
+  const result = await runQuery(
     `UPDATE users
-     SET credits = credits - ?,
+     SET credits = credits - $1,
          updated_at = CURRENT_TIMESTAMP
-     WHERE id = ? AND credits >= ?`,
+     WHERE id = $2 AND credits >= $3
+     RETURNING *`,
     [amount, userId, amount]
   );
+
+  if (result.rowCount === 0) {
+    throw new Error("Yetersiz kredi.");
+  }
+
+  return result.rows[0];
 }
 
 async function addCredits(userId, amount) {
-  await runQuery(
+  const result = await runQuery(
     `UPDATE users
-     SET credits = credits + ?,
+     SET credits = credits + $1,
          updated_at = CURRENT_TIMESTAMP
-     WHERE id = ?`,
+     WHERE id = $2
+     RETURNING *`,
     [amount, userId]
   );
+
+  if (result.rowCount === 0) {
+    throw new Error("Kullanıcı bulunamadı.");
+  }
+
+  return result.rows[0];
 }
 
 async function uploadImageToCloudinary(filePath) {
@@ -278,6 +301,7 @@ async function uploadImageToCloudinary(filePath) {
 
 function buildPrompt(motionType, customPrompt) {
   const preset = MOTION_PRESETS[motionType];
+
   if (!preset) {
     throw new Error("Geçersiz motionType.");
   }
@@ -291,6 +315,7 @@ function buildPrompt(motionType, customPrompt) {
 
 function buildNegativePrompt(motionType) {
   const preset = MOTION_PRESETS[motionType];
+
   if (!preset) {
     throw new Error("Geçersiz motionType.");
   }
@@ -408,12 +433,12 @@ function normalizeReplicateOutput(output) {
 async function updateGenerationStatus(id, data) {
   await runQuery(
     `UPDATE generations
-     SET status = ?,
-         output_video_url = ?,
-         error_message = ?,
-         replicate_prediction_id = ?,
+     SET status = $1,
+         output_video_url = $2,
+         error_message = $3,
+         replicate_prediction_id = $4,
          updated_at = CURRENT_TIMESTAMP
-     WHERE id = ?`,
+     WHERE id = $5`,
     [
       data.status || null,
       data.output_video_url || null,
@@ -426,7 +451,7 @@ async function updateGenerationStatus(id, data) {
 
 async function getPurchaseByTransactionId(transactionId) {
   return await getQuery(
-    `SELECT * FROM purchases WHERE transaction_id = ?`,
+    `SELECT * FROM purchases WHERE transaction_id = $1`,
     [transactionId]
   );
 }
@@ -530,7 +555,8 @@ app.post("/api/auth/register", async (req, res) => {
       });
     }
 
-    const existingUser = await getUserByEmail(email.trim().toLowerCase());
+    const normalizedEmail = email.trim().toLowerCase();
+    const existingUser = await getUserByEmail(normalizedEmail);
 
     if (existingUser) {
       return res.status(400).json({
@@ -543,11 +569,12 @@ app.post("/api/auth/register", async (req, res) => {
 
     const result = await runQuery(
       `INSERT INTO users (email, password_hash, full_name, is_premium, credits)
-       VALUES (?, ?, ?, 0, 0)`,
-      [email.trim().toLowerCase(), passwordHash, full_name || null]
+       VALUES ($1, $2, $3, 0, 0)
+       RETURNING *`,
+      [normalizedEmail, passwordHash, full_name || null]
     );
 
-    const user = await getUserById(result.lastID);
+    const user = result.rows[0];
     const token = createToken(user);
 
     return res.json({
@@ -714,7 +741,7 @@ app.post("/api/purchase/verify", authMiddleware, async (req, res) => {
         credits_added,
         environment,
         raw_signed_transaction
-      ) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7)`,
       [
         req.user.id,
         productId,
@@ -726,8 +753,7 @@ app.post("/api/purchase/verify", authMiddleware, async (req, res) => {
       ]
     );
 
-    await addCredits(req.user.id, creditsToAdd);
-    const updatedUser = await getUserById(req.user.id);
+    const updatedUser = await addCredits(req.user.id, creditsToAdd);
 
     console.log("✅ Credits added. New balance:", updatedUser?.credits);
 
@@ -822,7 +848,8 @@ app.post("/api/generate", authMiddleware, upload.single("image"), async (req, re
         negative_prompt,
         input_image_url,
         status
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+       RETURNING id`,
       [
         user.id,
         motionType,
@@ -835,14 +862,13 @@ app.post("/api/generate", authMiddleware, upload.single("image"), async (req, re
       ]
     );
 
-    const generationId = insertResult.lastID;
-
+    const generationId = insertResult.rows[0].id;
     const publicImageUrl = await uploadImageToCloudinary(uploadedFilePath);
 
     await runQuery(
       `UPDATE generations
-       SET input_image_url = ?, updated_at = CURRENT_TIMESTAMP
-       WHERE id = ?`,
+       SET input_image_url = $1, updated_at = CURRENT_TIMESTAMP
+       WHERE id = $2`,
       [publicImageUrl, generationId]
     );
 
@@ -876,11 +902,10 @@ app.post("/api/generate", authMiddleware, upload.single("image"), async (req, re
         replicate_prediction_id: finalPrediction.id
       });
 
-      await decrementCredit(user.id, creditCost);
-      const updatedUser = await getUserById(user.id);
+      const updatedUser = await decrementCredit(user.id, creditCost);
 
       const finalRow = await getQuery(
-        `SELECT * FROM generations WHERE id = ?`,
+        `SELECT * FROM generations WHERE id = $1`,
         [generationId]
       );
 
@@ -902,7 +927,7 @@ app.post("/api/generate", authMiddleware, upload.single("image"), async (req, re
     });
 
     const failedRow = await getQuery(
-      `SELECT * FROM generations WHERE id = ?`,
+      `SELECT * FROM generations WHERE id = $1`,
       [generationId]
     );
 
@@ -936,7 +961,7 @@ app.post("/api/generate", authMiddleware, upload.single("image"), async (req, re
 app.get("/api/generation/:id", authMiddleware, async (req, res) => {
   try {
     const row = await getQuery(
-      `SELECT * FROM generations WHERE id = ? AND user_id = ?`,
+      `SELECT * FROM generations WHERE id = $1 AND user_id = $2`,
       [req.params.id, req.user.id]
     );
 
@@ -962,7 +987,7 @@ app.get("/api/generation/:id", authMiddleware, async (req, res) => {
 app.get("/api/generations", authMiddleware, async (req, res) => {
   try {
     const rows = await allQuery(
-      `SELECT * FROM generations WHERE user_id = ? ORDER BY created_at DESC`,
+      `SELECT * FROM generations WHERE user_id = $1 ORDER BY created_at DESC`,
       [req.user.id]
     );
 
@@ -979,13 +1004,20 @@ app.get("/api/generations", authMiddleware, async (req, res) => {
 });
 
 app.get("/api/credits", authMiddleware, async (req, res) => {
-  const user = await getUserById(req.user.id);
+  try {
+    const user = await getUserById(req.user.id);
 
-  return res.json({
-    success: true,
-    credits: user.credits,
-    is_premium: !!user.is_premium
-  });
+    return res.json({
+      success: true,
+      credits: user.credits,
+      is_premium: !!user.is_premium
+    });
+  } catch (error) {
+    return res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
 });
 
 app.get("/api/purchases", authMiddleware, async (req, res) => {
@@ -993,7 +1025,7 @@ app.get("/api/purchases", authMiddleware, async (req, res) => {
     const rows = await allQuery(
       `SELECT id, product_id, transaction_id, original_transaction_id, credits_added, environment, created_at
        FROM purchases
-       WHERE user_id = ?
+       WHERE user_id = $1
        ORDER BY created_at DESC`,
       [req.user.id]
     );
@@ -1011,7 +1043,15 @@ app.get("/api/purchases", authMiddleware, async (req, res) => {
 });
 
 initDatabase()
-  .then(() => {
+  .then(async () => {
+    try {
+      await pool.query("SELECT 1");
+      console.log("PostgreSQL connected successfully.");
+    } catch (dbError) {
+      console.error("PostgreSQL connection failed:", dbError.message);
+      process.exit(1);
+    }
+
     console.log("REPLICATE_API_TOKEN exists:", !!process.env.REPLICATE_API_TOKEN);
     console.log("CLOUDINARY_CLOUD_NAME exists:", !!process.env.CLOUDINARY_CLOUD_NAME);
     console.log("CLOUDINARY_API_KEY exists:", !!process.env.CLOUDINARY_API_KEY);
@@ -1019,6 +1059,7 @@ initDatabase()
     console.log("JWT_SECRET exists:", !!process.env.JWT_SECRET);
     console.log("APPLE_BUNDLE_ID exists:", !!process.env.APPLE_BUNDLE_ID);
     console.log("APPLE_SHARED_SECRET exists:", !!process.env.APPLE_SHARED_SECRET);
+    console.log("DATABASE_URL exists:", !!process.env.DATABASE_URL);
 
     app.listen(PORT, () => {
       console.log(`Server running on port ${PORT}`);
@@ -1028,3 +1069,15 @@ initDatabase()
     console.error("DB init failed:", err);
     process.exit(1);
   });
+
+process.on("SIGINT", async () => {
+  console.log("SIGINT alındı, PostgreSQL pool kapatılıyor...");
+  await pool.end();
+  process.exit(0);
+});
+
+process.on("SIGTERM", async () => {
+  console.log("SIGTERM alındı, PostgreSQL pool kapatılıyor...");
+  await pool.end();
+  process.exit(0);
+});
