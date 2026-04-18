@@ -530,6 +530,127 @@ function pickMatchingReceiptItem(verifyData, productId) {
   return merged[0];
 }
 
+function extractCloudinaryPublicId(fileUrl) {
+  try {
+    if (!fileUrl || typeof fileUrl !== "string") {
+      return null;
+    }
+
+    const url = new URL(fileUrl);
+
+    if (!url.hostname.includes("cloudinary.com")) {
+      return null;
+    }
+
+    const pathname = url.pathname;
+    const uploadSegment = "/upload/";
+
+    if (!pathname.includes(uploadSegment)) {
+      return null;
+    }
+
+    const afterUpload = pathname.split(uploadSegment)[1];
+    if (!afterUpload) {
+      return null;
+    }
+
+    const parts = afterUpload.split("/");
+
+    let publicIdParts = parts;
+
+    if (parts[0] && /^v\d+$/.test(parts[0])) {
+      publicIdParts = parts.slice(1);
+    }
+
+    const joined = publicIdParts.join("/");
+    const ext = path.extname(joined);
+
+    if (ext) {
+      return joined.slice(0, -ext.length);
+    }
+
+    return joined;
+  } catch (error) {
+    return null;
+  }
+}
+
+async function deleteCloudinaryAssetByUrl(fileUrl, resourceType = "image") {
+  try {
+    const publicId = extractCloudinaryPublicId(fileUrl);
+
+    if (!publicId) {
+      return false;
+    }
+
+    const result = await cloudinary.uploader.destroy(publicId, {
+      resource_type: resourceType
+    });
+
+    console.log("Cloudinary delete result:", publicId, result);
+    return true;
+  } catch (error) {
+    console.error("Cloudinary asset silinemedi:", error.message);
+    return false;
+  }
+}
+
+async function deleteUserAccount(userId) {
+  const client = await pool.connect();
+
+  try {
+    await client.query("BEGIN");
+
+    const userResult = await client.query(
+      `SELECT id, email FROM users WHERE id = $1 FOR UPDATE`,
+      [userId]
+    );
+
+    if (userResult.rowCount === 0) {
+      throw new Error("Kullanıcı bulunamadı.");
+    }
+
+    const generationFilesResult = await client.query(
+      `SELECT input_image_url, output_video_url
+       FROM generations
+       WHERE user_id = $1`,
+      [userId]
+    );
+
+    const filesToDelete = generationFilesResult.rows.map((row) => ({
+      input_image_url: row.input_image_url,
+      output_video_url: row.output_video_url
+    }));
+
+    const deleteUserResult = await client.query(
+      `DELETE FROM users
+       WHERE id = $1
+       RETURNING id, email`,
+      [userId]
+    );
+
+    await client.query("COMMIT");
+
+    for (const fileRow of filesToDelete) {
+      if (fileRow.input_image_url) {
+        await deleteCloudinaryAssetByUrl(fileRow.input_image_url, "image");
+      }
+
+      // output_video_url şu an Replicate/CDN olabilir; Cloudinary değilse atlanır
+      if (fileRow.output_video_url) {
+        await deleteCloudinaryAssetByUrl(fileRow.output_video_url, "video");
+      }
+    }
+
+    return deleteUserResult.rows[0];
+  } catch (error) {
+    await client.query("ROLLBACK");
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
 app.get("/", (req, res) => {
   res.json({
     success: true,
@@ -639,6 +760,28 @@ app.get("/api/auth/me", authMiddleware, async (req, res) => {
     success: true,
     user: sanitizeUser(req.user)
   });
+});
+
+app.delete("/api/account", authMiddleware, async (req, res) => {
+  try {
+    const deletedUser = await deleteUserAccount(req.user.id);
+
+    return res.json({
+      success: true,
+      message: "Hesap kalıcı olarak silindi.",
+      deletedUser: {
+        id: deletedUser.id,
+        email: deletedUser.email
+      }
+    });
+  } catch (error) {
+    console.error("Account delete error:", error.message);
+
+    return res.status(500).json({
+      success: false,
+      error: error.message || "Hesap silinirken hata oluştu."
+    });
+  }
 });
 
 app.post("/api/purchase/verify", authMiddleware, async (req, res) => {
